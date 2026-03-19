@@ -19,10 +19,10 @@ const cleanupInterval = setInterval(() => {
       cleaned++;
     }
   }
-  // Clean up old rate limit entries
-  const windowMs = config.rateLimit.windowSeconds * 1000;
+  // Clean up old rate limit entries (remove phones with no recent activity in the last max window)
+  const maxDelayMs = Math.max(...config.rateLimit.progressiveDelaysMinutes) * 60 * 1000;
   for (const [phone, timestamps] of rateLimitStore) {
-    const valid = timestamps.filter((t) => t > now - windowMs);
+    const valid = timestamps.filter((t) => t > now - maxDelayMs);
     if (valid.length === 0) {
       rateLimitStore.delete(phone);
     } else {
@@ -46,20 +46,37 @@ function makeKey(phone, reference) {
 }
 
 /**
- * Check rate limit for a phone number.
+ * Check progressive rate limit for a phone number.
+ * Progressive delays (in minutes): [0, 2, 5, 10, 60, 3600]
+ *   1st request: no delay
+ *   2nd request: must wait 2 minutes after the 1st
+ *   3rd request: must wait 5 minutes after the 2nd
+ *   4th request: must wait 10 minutes after the 3rd
+ *   5th request: must wait 60 minutes after the 4th
+ *   6th+ request: must wait 3600 minutes after the previous
  * Returns { allowed: boolean, retryAfterSeconds?: number }
  */
 function checkRateLimit(phone) {
   const now = Date.now();
-  const windowMs = config.rateLimit.windowSeconds * 1000;
-  const timestamps = (rateLimitStore.get(phone) || []).filter((t) => t > now - windowMs);
-  rateLimitStore.set(phone, timestamps);
+  const timestamps = rateLimitStore.get(phone) || [];
+  const delays = config.rateLimit.progressiveDelaysMinutes;
+  const requestCount = timestamps.length;
 
-  if (timestamps.length >= config.rateLimit.max) {
-    const oldestInWindow = Math.min(...timestamps);
-    const retryAfterSeconds = Math.ceil((oldestInWindow + windowMs - now) / 1000);
+  if (requestCount === 0) {
+    return { allowed: true };
+  }
+
+  // Determine the required delay for the next request
+  const delayIndex = Math.min(requestCount, delays.length - 1);
+  const requiredDelayMs = delays[delayIndex] * 60 * 1000;
+  const lastTimestamp = timestamps[timestamps.length - 1];
+  const elapsed = now - lastTimestamp;
+
+  if (elapsed < requiredDelayMs) {
+    const retryAfterSeconds = Math.ceil((requiredDelayMs - elapsed) / 1000);
     return { allowed: false, retryAfterSeconds };
   }
+
   return { allowed: true };
 }
 
@@ -71,23 +88,6 @@ function recordRateLimitHit(phone) {
   const timestamps = rateLimitStore.get(phone) || [];
   timestamps.push(now);
   rateLimitStore.set(phone, timestamps);
-}
-
-/**
- * Check cooldown for a specific phone+reference pair.
- * Returns { allowed: boolean, retryAfterSeconds?: number }
- */
-function checkCooldown(phone, reference) {
-  const key = makeKey(phone, reference);
-  const existing = store.get(key);
-  if (!existing) return { allowed: true };
-
-  const elapsed = (Date.now() - existing.createdAt) / 1000;
-  if (elapsed < config.otp.cooldownSeconds) {
-    const retryAfterSeconds = Math.ceil(config.otp.cooldownSeconds - elapsed);
-    return { allowed: false, retryAfterSeconds };
-  }
-  return { allowed: true };
 }
 
 /**
@@ -184,4 +184,4 @@ function shutdown() {
   rateLimitStore.clear();
 }
 
-module.exports = { createOtp, verifyOtp, getStatus, checkRateLimit, checkCooldown, shutdown };
+module.exports = { createOtp, verifyOtp, getStatus, checkRateLimit, shutdown };

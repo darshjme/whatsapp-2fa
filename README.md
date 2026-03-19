@@ -21,7 +21,7 @@ Pair a sender number once via QR scan, then integrate two REST endpoints into an
 - **Direct WhatsApp delivery** — OTPs arrive in the user's WhatsApp chat via Baileys multi-device protocol
 - **Timing-safe verification** — OTP comparison uses `crypto.timingSafeEqual` to prevent timing side-channel attacks
 - **Timing-safe API key auth** — API key validation also uses constant-time comparison
-- **Rate limiting** — Configurable per-phone-number limit (default: 5 OTPs per hour) with per-reference cooldown
+- **Progressive rate limiting** — Escalating delays between OTP requests per phone number (0 / 2 / 5 / 10 / 60 / 3600 minutes)
 - **Cryptographic OTP generation** — Codes generated with `crypto.randomInt` (CSPRNG), not `Math.random`
 - **Session persistence** — Auth credentials saved to disk (`auth_store/`); survives process restarts without re-scanning QR
 - **Exponential backoff reconnection** — Automatic reconnection with jitter on WhatsApp disconnects
@@ -100,8 +100,7 @@ curl -X POST http://localhost:3000/api/otp/send \
   "success": true,
   "phone": "919876543210",
   "reference": "login-session-abc",
-  "expiresAt": "2025-01-15T10:05:00.000Z",
-  "cooldownSeconds": 60
+  "expiresAt": "2025-01-15T10:10:00.000Z"
 }
 ```
 
@@ -185,11 +184,8 @@ All settings are configured via environment variables. Copy `.env.example` to `.
 | `APP_NAME` | `MyApp` | Application name used in OTP message template |
 | `LOG_LEVEL` | `info` | pino log level (`debug`, `info`, `warn`, `error`, `fatal`) |
 | `OTP_LENGTH` | `6` | Number of digits in generated OTP codes |
-| `OTP_EXPIRY_SECONDS` | `300` | OTP validity duration in seconds |
+| `OTP_EXPIRY_SECONDS` | `600` | OTP validity duration in seconds (10 minutes) |
 | `OTP_MAX_ATTEMPTS` | `3` | Maximum wrong verification attempts before invalidation |
-| `OTP_COOLDOWN_SECONDS` | `60` | Minimum wait between OTP requests for the same phone+reference |
-| `RATE_LIMIT_MAX` | `5` | Maximum OTP requests per phone number within the rate window |
-| `RATE_LIMIT_WINDOW_SECONDS` | `3600` | Rate limit sliding window duration in seconds |
 | `OTP_MESSAGE_TEMPLATE` | _(see below)_ | WhatsApp message template with `{{otp}}` and `{{app_name}}` placeholders |
 
 Default message template:
@@ -197,8 +193,23 @@ Default message template:
 ```
 Your {{app_name}} verification code is: *{{otp}}*
 
-This code expires in 5 minutes. Do not share it with anyone.
+This code expires in 10 minutes. Do not share it with anyone.
 ```
+
+### Progressive Rate Limiting
+
+OTP requests are rate-limited per phone number with escalating delays. After each OTP is sent, the user must wait the required delay before requesting another:
+
+| Request # | Required delay before next request |
+|-----------|-----------------------------------|
+| 1st | No delay |
+| 2nd | 2 minutes |
+| 3rd | 5 minutes |
+| 4th | 10 minutes |
+| 5th | 60 minutes |
+| 6th+ | 3600 minutes (60 hours) |
+
+This progressive backoff discourages abuse while allowing legitimate users to retry quickly on their first few attempts. The delay is measured from the time the previous OTP was sent.
 
 ## Integration Example
 
@@ -253,7 +264,7 @@ if (result.success) {
 | OTP generation | `crypto.randomInt` (CSPRNG) with configurable code length |
 | OTP verification | `crypto.timingSafeEqual` prevents timing side-channel attacks |
 | API authentication | API key checked with constant-time comparison |
-| Rate limiting | Per-phone sliding window (default 5/hour) plus per-reference cooldown |
+| Rate limiting | Progressive per-phone delays (0 / 2 / 5 / 10 / 60 / 3600 min) |
 | Brute-force protection | Maximum verification attempts per OTP (default 3), then invalidated |
 | Input validation | Strict regex patterns on phone, reference, and code fields |
 | Payload limits | Request body capped at 16 KB |
@@ -293,7 +304,7 @@ if (result.success) {
 - **Express HTTP server** — Handles REST API requests with JSON parsing and request logging
 - **Baileys WebSocket client** — Maintains persistent connection to WhatsApp multi-device protocol
 - **In-memory OTP store** — Map-based storage with automatic expiry cleanup every 60 seconds
-- **Rate limiter** — Sliding window counter per phone number with configurable thresholds
+- **Rate limiter** — Progressive delay per phone number with escalating backoff tiers
 - **Auth state persistence** — Multi-file auth state saved to `auth_store/` for session continuity
 
 ## License

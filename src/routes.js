@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { config } = require('./config');
 const { logger } = require('./logger');
-const { createOtp, verifyOtp, getStatus, checkRateLimit, checkCooldown } = require('./otp-store');
+const { createOtp, verifyOtp, getStatus, checkRateLimit } = require('./otp-store');
 const { sendMessage, getConnectionStatus } = require('./whatsapp');
 
 const router = express.Router();
@@ -101,15 +101,6 @@ router.post('/otp/send', async (req, res) => {
       });
     }
 
-    // Cooldown check (per phone+reference pair)
-    const cooldownCheck = checkCooldown(phone, reference);
-    if (!cooldownCheck.allowed) {
-      return res.status(429).json({
-        error: 'Please wait before requesting a new code.',
-        retryAfterSeconds: cooldownCheck.retryAfterSeconds,
-      });
-    }
-
     // Create OTP and send
     const record = createOtp(phone, reference);
     const message = config.otp.messageTemplate
@@ -123,7 +114,6 @@ router.post('/otp/send', async (req, res) => {
       phone,
       reference,
       expiresAt: new Date(record.expiresAt).toISOString(),
-      cooldownSeconds: config.otp.cooldownSeconds,
     });
   } catch (err) {
     logger.error({ err: err.message, stack: err.stack }, 'OTP send error');
