@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-2fa",
+  "version": "1.0.0",
+  "description": "WhatsApp-based 2FA/OTP service using Baileys",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": ["whatsapp", "2fa", "otp", "baileys"],
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0",
+    "dotenv": "^16.4.7"
+  }
+}
