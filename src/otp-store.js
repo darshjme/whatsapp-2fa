@@ -1,16 +1,39 @@
 const crypto = require('crypto');
 const { config } = require('./config');
+const { logger } = require('./logger');
 
-// In-memory store: key = "phone:reference" → { otp, phone, reference, expiresAt, attempts, verified }
+// In-memory store: key = "phone:reference" -> { otp, phone, reference, expiresAt, createdAt, attempts, verified }
 const store = new Map();
 
+// Rate limit store: key = phone -> [timestamps]
+const rateLimitStore = new Map();
+
 // Cleanup expired entries every 60s
-setInterval(() => {
+const cleanupInterval = setInterval(() => {
   const now = Date.now();
+  let cleaned = 0;
   for (const [key, record] of store) {
-    if (record.expiresAt < now) store.delete(key);
+    // Remove expired records (keep for 30s after expiry for status checks)
+    if (record.expiresAt + 30_000 < now) {
+      store.delete(key);
+      cleaned++;
+    }
   }
-}, 60_000).unref();
+  // Clean up old rate limit entries
+  const windowMs = config.rateLimit.windowSeconds * 1000;
+  for (const [phone, timestamps] of rateLimitStore) {
+    const valid = timestamps.filter((t) => t > now - windowMs);
+    if (valid.length === 0) {
+      rateLimitStore.delete(phone);
+    } else {
+      rateLimitStore.set(phone, valid);
+    }
+  }
+  if (cleaned > 0) {
+    logger.debug({ cleaned }, 'OTP store cleanup');
+  }
+}, 60_000);
+cleanupInterval.unref();
 
 function generateOtp() {
   const max = Math.pow(10, config.otp.length);
@@ -22,20 +45,77 @@ function makeKey(phone, reference) {
   return `${phone}:${reference}`;
 }
 
+/**
+ * Check rate limit for a phone number.
+ * Returns { allowed: boolean, retryAfterSeconds?: number }
+ */
+function checkRateLimit(phone) {
+  const now = Date.now();
+  const windowMs = config.rateLimit.windowSeconds * 1000;
+  const timestamps = (rateLimitStore.get(phone) || []).filter((t) => t > now - windowMs);
+  rateLimitStore.set(phone, timestamps);
+
+  if (timestamps.length >= config.rateLimit.max) {
+    const oldestInWindow = Math.min(...timestamps);
+    const retryAfterSeconds = Math.ceil((oldestInWindow + windowMs - now) / 1000);
+    return { allowed: false, retryAfterSeconds };
+  }
+  return { allowed: true };
+}
+
+/**
+ * Record a rate limit hit for a phone number.
+ */
+function recordRateLimitHit(phone) {
+  const now = Date.now();
+  const timestamps = rateLimitStore.get(phone) || [];
+  timestamps.push(now);
+  rateLimitStore.set(phone, timestamps);
+}
+
+/**
+ * Check cooldown for a specific phone+reference pair.
+ * Returns { allowed: boolean, retryAfterSeconds?: number }
+ */
+function checkCooldown(phone, reference) {
+  const key = makeKey(phone, reference);
+  const existing = store.get(key);
+  if (!existing) return { allowed: true };
+
+  const elapsed = (Date.now() - existing.createdAt) / 1000;
+  if (elapsed < config.otp.cooldownSeconds) {
+    const retryAfterSeconds = Math.ceil(config.otp.cooldownSeconds - elapsed);
+    return { allowed: false, retryAfterSeconds };
+  }
+  return { allowed: true };
+}
+
+/**
+ * Create a new OTP for the given phone and reference.
+ * Previous OTP for the same key is overwritten.
+ */
 function createOtp(phone, reference) {
   const key = makeKey(phone, reference);
+  const otp = generateOtp();
   const record = {
-    otp: generateOtp(),
+    otp,
     phone,
     reference,
+    createdAt: Date.now(),
     expiresAt: Date.now() + config.otp.expirySeconds * 1000,
     attempts: 0,
     verified: false,
   };
   store.set(key, record);
+  recordRateLimitHit(phone);
+  logger.info({ phone, reference }, 'OTP created');
   return record;
 }
 
+/**
+ * Verify an OTP using timing-safe comparison.
+ * Returns { success: boolean, reason?: string }
+ */
 function verifyOtp(phone, reference, code) {
   const key = makeKey(phone, reference);
   const record = store.get(key);
@@ -53,15 +133,55 @@ function verifyOtp(phone, reference, code) {
 
   record.attempts++;
 
-  if (record.otp !== code) return { success: false, reason: 'invalid' };
+  // Timing-safe comparison to prevent timing attacks
+  const codeStr = String(code).padStart(config.otp.length, '0');
+  const otpBuf = Buffer.from(record.otp, 'utf8');
+  const codeBuf = Buffer.from(codeStr, 'utf8');
+
+  let match = false;
+  if (otpBuf.length === codeBuf.length) {
+    match = crypto.timingSafeEqual(otpBuf, codeBuf);
+  }
+
+  if (!match) {
+    logger.info({ phone, reference, attempts: record.attempts }, 'OTP verification failed');
+    return { success: false, reason: 'invalid' };
+  }
 
   record.verified = true;
-  setTimeout(() => store.delete(key), 30_000).unref();
+  // Auto-cleanup verified record after 30s
+  const cleanupTimer = setTimeout(() => store.delete(key), 30_000);
+  cleanupTimer.unref();
+
+  logger.info({ phone, reference }, 'OTP verified successfully');
   return { success: true };
 }
 
+/**
+ * Get status for a phone+reference (never returns the OTP itself).
+ */
 function getStatus(phone, reference) {
-  return store.get(makeKey(phone, reference)) || null;
+  const record = store.get(makeKey(phone, reference));
+  if (!record) return null;
+  return {
+    phone: record.phone,
+    reference: record.reference,
+    verified: record.verified,
+    attempts: record.attempts,
+    maxAttempts: config.otp.maxAttempts,
+    expired: Date.now() > record.expiresAt,
+    expiresAt: new Date(record.expiresAt).toISOString(),
+    createdAt: new Date(record.createdAt).toISOString(),
+  };
 }
 
-module.exports = { createOtp, verifyOtp, getStatus };
+/**
+ * Shutdown: clear the cleanup interval.
+ */
+function shutdown() {
+  clearInterval(cleanupInterval);
+  store.clear();
+  rateLimitStore.clear();
+}
+
+module.exports = { createOtp, verifyOtp, getStatus, checkRateLimit, checkCooldown, shutdown };
